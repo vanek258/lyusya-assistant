@@ -1,0 +1,136 @@
+"""Ядро диалога: принимает фразы, решает, что с ними делать, и формирует ответы.
+
+DialogueManager не знает про окно и Tkinter. Он получает фразы (с голоса через
+VoiceSink или напечатанные через submit), выполняет их по одной в своём
+фоновом потоке и кладёт ответы и состояния в очередь outbox, которую
+забирает интерфейс.
+
+Сюда же перенесено решение, когда ставить музыку на паузу: услышала имя —
+пауза, команда не про музыку — вернуть, команда про музыку — оставить как есть.
+"""
+
+import ctypes
+import logging
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import media
+from commands import parse
+from events import HEARD, LISTENING, NOTICE, THINKING, TIMEOUT, VOICE, Reply, StateEvent, Utterance
+from executor import Executor, Response
+
+log = logging.getLogger("dialogue")
+
+MUSIC_EFFECTS = {"music_on", "music_off", "music_launch", "music_close"}
+
+
+class VoiceSink:
+    """Принимает события из VoiceListener (он вызывает put, как у очереди)."""
+
+    def __init__(self, handler):
+        self._handler = handler
+
+    def put(self, event):
+        self._handler(*event)
+
+
+class DialogueManager:
+    def __init__(self, config: dict, executor: Executor | None = None, ducker=None):
+        self.config = config
+        self.name = config.get("assistant_name", "Люся")
+        self.executor = executor or Executor(config)
+        self.ducker = ducker if ducker is not None else (media.Ducker() if media.AVAILABLE else None)
+        self.outbox: queue.Queue = queue.Queue()
+        self.voice_sink = VoiceSink(self._on_voice)
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dialogue")
+        self._lock = threading.Lock()
+        self._busy = False
+        self._next_id = 0
+        self._cancelled_up_to = 0  # ответы на запросы с номером не больше этого — устарели
+
+    # --- Вход ----------------------------------------------------------------
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def submit(self, utterance: Utterance) -> int | None:
+        """Принимает фразу в обработку. None — Люся занята предыдущей и фразу не взяла."""
+        text = utterance.text.strip()
+        with self._lock:
+            if not text or self._busy:
+                return None
+            self._busy = True
+            self._next_id += 1
+            request_id = self._next_id
+        self._pool.submit(self._process, request_id, utterance)
+        return request_id
+
+    def cancel_pending(self):
+        """Ответы на уже отправленные запросы больше не нужны (будут отброшены)."""
+        with self._lock:
+            self._cancelled_up_to = self._next_id
+
+    def shutdown(self):
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        if self.ducker is not None:
+            self.ducker.shutdown()
+
+    def _on_voice(self, kind: str, text: str = "", *rest):
+        """События речи (вызывается из потока распознавания)."""
+        if kind == "wake":
+            if self.busy:
+                return
+            if self.ducker is not None:
+                self.ducker.duck()  # пауза музыке, чтобы лучше слышать команду
+            self.outbox.put(StateEvent(LISTENING))
+        elif kind == "partial":
+            self.outbox.put(StateEvent(HEARD, text))
+        elif kind == "command":
+            confidence = rest[0] if rest else 1.0
+            self.submit(Utterance(text, source=VOICE, confidence=confidence))
+        elif kind == "timeout":
+            if self.ducker is not None:
+                self.ducker.unduck()
+            self.outbox.put(StateEvent(TIMEOUT))
+        elif kind in ("error", "notice"):
+            self.outbox.put(StateEvent(NOTICE, text))
+
+    # --- Обработка (в фоновом потоке) -------------------------------------------
+
+    def _process(self, request_id: int, utterance: Utterance):
+        self.outbox.put(StateEvent(THINKING))
+        # COM нужен для os.startfile вне главного потока. Завершаем его в том же
+        # потоке, если инициализация удалась (S_OK или S_FALSE — оба требуют CoUninitialize)
+        hr = ctypes.windll.ole32.CoInitialize(None)
+        try:
+            response = self._handle(utterance)
+        except Exception as e:  # чтобы Люся не зависла при неожиданной ошибке
+            log.exception("ошибка обработки запроса")
+            response = Response(f"Ой, ошибка: {e}", ok=False)
+        finally:
+            if hr >= 0:
+                ctypes.windll.ole32.CoUninitialize()
+            with self._lock:
+                self._busy = False
+                stale = request_id <= self._cancelled_up_to
+
+        self._after_response(response)
+        if stale:
+            log.info("ответ на запрос %d отброшен как устаревший", request_id)
+            return
+        self.outbox.put(Reply(response.text, response.ok, response.effect, response.keep_running, request_id))
+
+    def _handle(self, utterance: Utterance) -> Response:
+        return self.executor.execute(parse(utterance.text, self.name))
+
+    def _after_response(self, response: Response):
+        """Музыка после команды: не про музыку — вернуть, про музыку — оставить как решила команда."""
+        if self.ducker is None:
+            return
+        if response.effect in MUSIC_EFFECTS:
+            self.ducker.forget()
+        else:
+            self.ducker.unduck()

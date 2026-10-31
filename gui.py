@@ -13,13 +13,11 @@
 import ctypes
 import queue
 import random
-import threading
 import time
 import tkinter as tk
 
-import media
-from commands import parse
-from executor import Executor, Response
+from dialogue import DialogueManager
+from events import HEARD, LISTENING, NOTICE, THINKING, TIMEOUT, TYPED, Reply, Utterance
 from listener import VoiceListener
 from sprites import SIZE, Pose, render
 
@@ -45,7 +43,6 @@ ACTIVITIES = {
     "cook": (1, (10, 16)),
 }
 MUSIC_ACTIVITIES = {"dance": (5, (8, 14)), "idle": (2, (4, 8)), "read": (1, (20, 40))}
-MUSIC_EFFECTS = {"music_on", "music_off", "music_launch", "music_close"}
 
 # Значок над головой после успешной команды
 EFFECT_GLYPHS = {"vol_up": "+", "vol_down": "-", "mute": "x", "music_on": "♪", "music_launch": "♪"}
@@ -71,9 +68,8 @@ class PetApp:
         enable_dpi_awareness()
         self.config = config
         self.name = config.get("assistant_name", "Люся")
-        self.executor = Executor(config)
-        self.results: queue.Queue[Response] = queue.Queue()
-        self.voice_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        # Вся логика команд и диалога — в ядре; окно только показывает его ответы
+        self.dialogue = DialogueManager(config)
 
         self.root = tk.Tk()
         self.root.title(self.name)
@@ -120,10 +116,7 @@ class PetApp:
         self.walk_target = self.x
         self.effect_glyph = ""
         self.music_on = False
-        # Пауза музыки, пока она слушает команду (все операции — в одном фоновом потоке)
-        self.ducker = media.Ducker() if media.AVAILABLE else None
         self.listener: VoiceListener | None = None
-        self.busy = False
         self.bubble_text = ""
         self.bubble_chars = 0     # сколько букв уже «напечатано»
         self.bubble_until = 0.0
@@ -138,7 +131,7 @@ class PetApp:
         self.entry.bind("<Escape>", lambda e: self._hide_entry())
 
     def run(self):
-        self.listener = VoiceListener(self.config, self.voice_events)
+        self.listener = VoiceListener(self.config, self.dialogue.voice_sink)
         self.listener.start()
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
         self.set_state("wave", 3)
@@ -158,9 +151,9 @@ class PetApp:
         if self.listener is not None:
             self.listener.stop()  # закрывает аудиопоток и освобождает микрофон
             self.listener = None
-        if self.ducker is not None:
-            self.ducker.shutdown()
-            self.ducker = None
+        if self.dialogue is not None:
+            self.dialogue.shutdown()
+            self.dialogue = None
 
     # --- Состояние и реплики ------------------------------------------------
 
@@ -194,85 +187,51 @@ class PetApp:
         else:
             self.set_state(name, random.uniform(*duration))
 
-    # --- Выполнение команд --------------------------------------------------
+    # --- Связь с ядром --------------------------------------------------------
 
     def run_text(self, text: str):
-        """Принимает команду — распознанную речь или напечатанный текст."""
-        text = text.strip()
+        """Напечатанная команда (из поля ввода или меню)."""
         self.entry.delete(0, "end")
-        if not text or self.busy:
-            return
-        self.busy = True
-        self.set_state("think")
-        cmd = parse(text, self.name)
-        # Команда выполняется в отдельном потоке, чтобы анимация не замирала
-        threading.Thread(target=self._worker, args=(cmd,), daemon=True).start()
-        self.root.after(400, self._check_result)
+        self.dialogue.submit(Utterance(text, source=TYPED))
 
-    def _worker(self, cmd):
-        # COM нужен для os.startfile вне главного потока. Завершаем его в том же
-        # потоке, если инициализация удалась (S_OK или S_FALSE — оба требуют CoUninitialize)
-        hr = ctypes.windll.ole32.CoInitialize(None)
-        try:
-            response = self.executor.execute(cmd)
-        except Exception as e:  # чтобы героиня не зависла при неожиданной ошибке
-            response = Response(f"Ой, ошибка: {e}", ok=False)
-        finally:
-            if hr >= 0:
-                ctypes.windll.ole32.CoUninitialize()
-        self.results.put(response)
+    def _handle_core(self):
+        """Забирает из ядра ответы и состояния и показывает их."""
+        while True:
+            try:
+                item = self.dialogue.outbox.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, Reply):
+                self._show_reply(item)
+            elif item.state == LISTENING:
+                self.set_state("listen", 12)
+                self.say("Да?")
+            elif item.state == HEARD and self.state == "listen":
+                self.say(item.text + "…", instant=True)
+            elif item.state == THINKING:
+                self.set_state("think")
+            elif item.state == TIMEOUT and self.state == "listen":
+                self.set_state("idle", 3)
+                self.say("Не расслышала…")
+            elif item.state == NOTICE:
+                self.say(item.text)
 
-    def _check_result(self):
-        try:
-            response = self.results.get_nowait()
-        except queue.Empty:
-            self.root.after(100, self._check_result)
-            return
-        self.busy = False
-        self.say(response.text)
-        if self.ducker is not None:
-            if response.effect not in MUSIC_EFFECTS:
-                self.ducker.unduck()  # команда не про музыку — возвращаем то, что играло
-            else:
-                self.ducker.forget()
-        if response.effect in ("music_on", "music_launch"):
+    def _show_reply(self, reply: Reply):
+        self.say(reply.text)
+        if reply.effect in ("music_on", "music_launch"):
             self.music_on = True
-        elif response.effect in ("music_off", "music_close"):
+        elif reply.effect in ("music_off", "music_close"):
             self.music_on = False
 
-        if not response.keep_running:
+        if not reply.keep_running:
             self._hide_entry()
             self.set_state("wave")
             self.root.after(2000, self.shutdown)
-        elif response.ok:
-            self.effect_glyph = EFFECT_GLYPHS.get(response.effect, "♥")
+        elif reply.ok:
+            self.effect_glyph = EFFECT_GLYPHS.get(reply.effect, "♥")
             self.set_state("happy", 1.8)
         else:
             self.set_state("confused", 2.5)
-
-    def _handle_voice(self):
-        """Забирает события из потока распознавания речи."""
-        while True:
-            try:
-                kind, text = self.voice_events.get_nowait()
-            except queue.Empty:
-                return
-            if kind == "wake" and not self.busy:
-                self.set_state("listen", 12)
-                self.say("Да?")
-                if self.ducker is not None:
-                    self.ducker.duck()  # пауза музыке, чтобы лучше слышать команду
-            elif kind == "partial" and self.state == "listen":
-                self.say(text + "…", instant=True)
-            elif kind == "command":
-                self.run_text(text)
-            elif kind == "timeout" and self.state == "listen":
-                self.set_state("idle", 3)
-                self.say("Не расслышала…")
-                if self.ducker is not None:
-                    self.ducker.unduck()
-            elif kind in ("error", "notice"):
-                self.say(text)
 
     # --- Мышь и поле ввода --------------------------------------------------
 
@@ -337,7 +296,8 @@ class PetApp:
     def _animate(self):
         self.tick += 1
         self.bubble_chars = min(len(self.bubble_text), self.bubble_chars + TYPE_SPEED)
-        self._handle_voice()
+        if self.dialogue is not None:
+            self._handle_core()
         if time.monotonic() >= self.state_until:
             self._pick_activity()
         self._move()
