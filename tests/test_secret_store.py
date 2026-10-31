@@ -70,14 +70,24 @@ class SecretStoreTest(unittest.TestCase):
     def test_cli_never_prints_the_key(self):
         backend = FakeKeyring()
         with mock.patch.object(secret_store, "SecretStore", lambda: SecretStore(backend=backend, environ={})), \
-                mock.patch.object(secret_store.getpass, "getpass", return_value=SECRET):
+                mock.patch.object(secret_store.getpass, "getpass", return_value=SECRET), \
+                mock.patch.object(secret_store, "ask_in_window", return_value=SECRET):
             out = io.StringIO()
             with redirect_stdout(out):
-                secret_store.main(["set", "gemini_api_key"])
+                secret_store.main(["set", "gemini_api_key"])          # через окошко
+                secret_store.main(["set-console", "gemini_api_key"])  # через терминал
                 secret_store.main(["check", "gemini_api_key"])
         self.assertNotIn(SECRET, out.getvalue())
         self.assertIn("есть", out.getvalue())
         self.assertEqual(backend.data[(SERVICE, "gemini_api_key")], SECRET)
+
+    def test_closed_window_saves_nothing(self):
+        backend = FakeKeyring()
+        with mock.patch.object(secret_store, "SecretStore", lambda: SecretStore(backend=backend, environ={})), \
+                mock.patch.object(secret_store, "ask_in_window", return_value=None):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(secret_store.main(["set", "gemini_api_key"]), 1)
+        self.assertEqual(backend.data, {})
 
 
 if __name__ == "__main__":
