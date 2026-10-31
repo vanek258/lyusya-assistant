@@ -64,9 +64,9 @@ class Executor:
         if cmd.intent == commands.CLOSE:
             return self.close(cmd.argument)
         if cmd.intent == commands.MUSIC:
-            return self.play_music()
+            return self._media_safely(self.play_music)
         if cmd.intent == commands.MEDIA:
-            return self.media(cmd.argument)
+            return self._media_safely(self.media, cmd.argument)
         if cmd.intent == commands.VOLUME:
             return self.volume(cmd.argument)
         return Response("Не поняла… Скажи «помощь».", ok=False)
@@ -104,9 +104,19 @@ class Executor:
             return Response(f"Не знаю, как закрыть «{name}»: нет поля process в config.json.", ok=False)
         if not system.is_running(process):
             return Response(f"{name.capitalize()} и так закрыт.")
-        system.close_process(process, item.get("force_close", False))
         effect = "music_close" if item["key"] == self.music_key else "close"
-        return Response(f"Закрываю {name}.", effect=effect)
+
+        if item.get("force_close", False):
+            # Явно разрешено в config.json (программа прячется в трей по крестику)
+            system.kill_process(process)
+            return Response(f"Закрываю {name}.", effect=effect)
+
+        windows = system.main_windows(process)
+        if not windows:
+            # Процесс есть, но окон нет — это фоновая часть программы, её не трогаем
+            return Response(f"У «{name}» нет открытых окон — закрывать нечего.", ok=False)
+        system.close_windows(windows)
+        return Response(f"Закрываю {name}. Если что-то не сохранено, программа спросит.", effect=effect)
 
     def play_music(self) -> Response:
         """Включает именно Яндекс.Музыку. Если она закрыта — запускает и ждёт, пока загрузится."""
@@ -153,6 +163,16 @@ class Executor:
         return Response(VOLUME_TEXTS[action], effect=f"vol_{action}" if action != "mute" else "mute")
 
     # --- Вспомогательное ----------------------------------------------------
+
+    @staticmethod
+    def _media_safely(action, *args) -> Response:
+        """Выполняет музыкальную команду и честно сообщает, если плеер не ответил."""
+        try:
+            return action(*args)
+        except media.MediaTimeout:
+            return Response("Плеер не ответил вовремя — не знаю, сработало ли. Проверь сам.", ok=False)
+        except OSError as e:  # ошибки WinRT приходят как OSError
+            return Response(f"Не получилось управлять плеером: {e}", ok=False)
 
     @staticmethod
     def _start(target: str, success_message: str, effect: str = "launch") -> Response:

@@ -5,3 +5,7 @@ models/
 logs/
 __pycache__/
 *.pyc
+
+# Секреты (API-ключи на следующих этапах) — никогда не публикуются
+.env
+secrets.json

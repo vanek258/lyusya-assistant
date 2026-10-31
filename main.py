@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from commands import parse
-from config import load_config
+from config import ConfigError, load_config
 from executor import Executor
 
 
@@ -30,9 +30,27 @@ def run_console(config: dict) -> None:
             break
 
 
+def show_config_error(error: ConfigError, console: bool) -> None:
+    """Показывает ошибку настроек: в консоли — текстом, иначе — окошком."""
+    if console:
+        print(error, file=sys.stderr)
+        return
+    import tkinter as tk
+    from tkinter import messagebox
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("Люся: ошибка в настройках", str(error))
+    root.destroy()
+
+
 def main() -> None:
-    config = load_config()
-    if "--console" in sys.argv:
+    console = "--console" in sys.argv
+    try:
+        config = load_config()
+    except ConfigError as e:
+        show_config_error(e, console)
+        sys.exit(1)
+    if console:
         run_console(config)
     else:
         logs = Path(__file__).with_name("logs")

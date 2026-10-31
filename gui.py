@@ -120,7 +120,9 @@ class PetApp:
         self.walk_target = self.x
         self.effect_glyph = ""
         self.music_on = False
-        self.ducked: list[str] = []  # плееры, поставленные на паузу, пока она слушает
+        # Пауза музыки, пока она слушает команду (все операции — в одном фоновом потоке)
+        self.ducker = media.Ducker() if media.AVAILABLE else None
+        self.listener: VoiceListener | None = None
         self.busy = False
         self.bubble_text = ""
         self.bubble_chars = 0     # сколько букв уже «напечатано»
@@ -136,11 +138,29 @@ class PetApp:
         self.entry.bind("<Escape>", lambda e: self._hide_entry())
 
     def run(self):
-        VoiceListener(self.config, self.voice_events).start()
+        self.listener = VoiceListener(self.config, self.voice_events)
+        self.listener.start()
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
         self.set_state("wave", 3)
         self.say(f"Привет! Я {self.name}. Позови меня по имени и скажи, что сделать.")
         self._animate()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self._stop_background()
+
+    def shutdown(self):
+        """Штатное выключение: останавливаем фоновые потоки и закрываем окно."""
+        self._stop_background()
+        self.root.destroy()
+
+    def _stop_background(self):
+        if self.listener is not None:
+            self.listener.stop()  # закрывает аудиопоток и освобождает микрофон
+            self.listener = None
+        if self.ducker is not None:
+            self.ducker.shutdown()
+            self.ducker = None
 
     # --- Состояние и реплики ------------------------------------------------
 
@@ -190,11 +210,16 @@ class PetApp:
         self.root.after(400, self._check_result)
 
     def _worker(self, cmd):
-        ctypes.windll.ole32.CoInitialize(None)  # нужно для os.startfile вне главного потока
+        # COM нужен для os.startfile вне главного потока. Завершаем его в том же
+        # потоке, если инициализация удалась (S_OK или S_FALSE — оба требуют CoUninitialize)
+        hr = ctypes.windll.ole32.CoInitialize(None)
         try:
             response = self.executor.execute(cmd)
         except Exception as e:  # чтобы героиня не зависла при неожиданной ошибке
             response = Response(f"Ой, ошибка: {e}", ok=False)
+        finally:
+            if hr >= 0:
+                ctypes.windll.ole32.CoUninitialize()
         self.results.put(response)
 
     def _check_result(self):
@@ -205,10 +230,11 @@ class PetApp:
             return
         self.busy = False
         self.say(response.text)
-        if response.effect not in MUSIC_EFFECTS:
-            self._unduck()  # команда не про музыку — возвращаем то, что играло
-        else:
-            self.ducked = []
+        if self.ducker is not None:
+            if response.effect not in MUSIC_EFFECTS:
+                self.ducker.unduck()  # команда не про музыку — возвращаем то, что играло
+            else:
+                self.ducker.forget()
         if response.effect in ("music_on", "music_launch"):
             self.music_on = True
         elif response.effect in ("music_off", "music_close"):
@@ -217,7 +243,7 @@ class PetApp:
         if not response.keep_running:
             self._hide_entry()
             self.set_state("wave")
-            self.root.after(2000, self.root.destroy)
+            self.root.after(2000, self.shutdown)
         elif response.ok:
             self.effect_glyph = EFFECT_GLYPHS.get(response.effect, "♥")
             self.set_state("happy", 1.8)
@@ -234,7 +260,8 @@ class PetApp:
             if kind == "wake" and not self.busy:
                 self.set_state("listen", 12)
                 self.say("Да?")
-                self._duck()
+                if self.ducker is not None:
+                    self.ducker.duck()  # пауза музыке, чтобы лучше слышать команду
             elif kind == "partial" and self.state == "listen":
                 self.say(text + "…", instant=True)
             elif kind == "command":
@@ -242,23 +269,10 @@ class PetApp:
             elif kind == "timeout" and self.state == "listen":
                 self.set_state("idle", 3)
                 self.say("Не расслышала…")
-                self._unduck()
-            elif kind == "error":
+                if self.ducker is not None:
+                    self.ducker.unduck()
+            elif kind in ("error", "notice"):
                 self.say(text)
-
-    def _duck(self):
-        """Пока она слушает команду, ставим музыку и видео на паузу, чтобы лучше слышать."""
-        if not media.AVAILABLE or self.ducked:
-            return
-
-        def work():
-            self.ducked = media.pause_playing()
-        threading.Thread(target=work, daemon=True).start()
-
-    def _unduck(self):
-        ids, self.ducked = self.ducked, []
-        if ids:
-            threading.Thread(target=media.resume, args=(ids,), daemon=True).start()
 
     # --- Мышь и поле ввода --------------------------------------------------
 

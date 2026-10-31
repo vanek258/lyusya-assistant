@@ -58,6 +58,7 @@
   "voice_model": "models/vosk-model-small-ru-0.22",
   "wake_words": ["люся", "люсь", "люсе", "люсю"],
   "raw_microphone": true,
+  "debug_speech_log": false,
   "max_command_words": 6,
   "command_timeout": 7,
 

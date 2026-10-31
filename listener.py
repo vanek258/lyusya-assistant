@@ -16,6 +16,11 @@
   ("command", текст)  — готовая команда
   ("timeout", "")     — после имени ничего не сказали
   ("error", текст)    — нет модели, библиотек или микрофона
+  ("notice", текст)   — служебное сообщение (например, включён подробный журнал)
+
+Приватность: по умолчанию в журнал пишутся только технические события
+(микрофон, громкость, сбои, «услышала имя»). Сами фразы пишутся, только если
+в config.json включён debug_speech_log — и об этом сообщается при запуске.
 """
 
 import ctypes
@@ -32,9 +37,13 @@ from pathlib import Path
 import sounds
 from commands import UNKNOWN, normalize, parse
 
-# Журнал голоса (logs/voice.log): что слышно, громкость микрофона, сбои потока.
+# Журнал голоса (logs/voice.log): громкость микрофона, сбои потока, срабатывания имени.
 # Нужен, чтобы разбираться, почему она не услышала команду.
 log = logging.getLogger("voice")
+
+# Сколько блоков звука (по 0,2 с) может ждать распознавания. Если распознавание
+# не успевает, самые старые блоки выбрасываются — иначе задержка росла бы бесконечно.
+AUDIO_QUEUE_BLOCKS = 25
 
 
 def ascii_path(path: Path) -> str:
@@ -87,14 +96,33 @@ class VoiceListener(threading.Thread):
         self.timeout = config.get("command_timeout", 7)
         self.max_command_words = config.get("max_command_words", 6)
         self.raw_mic = config.get("raw_microphone", True)
-        self.audio: queue.Queue[bytes] = queue.Queue()
+        self.debug_speech = config.get("debug_speech_log", False)
+        self.audio: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_BLOCKS)
+        self.dropped_blocks = 0  # сколько блоков выброшено из-за переполнения очереди
+        self._stop_event = threading.Event()
         self.channels = 1
         self._last_partial = ""
         self._level_sum = 0.0    # для средней громкости микрофона в журнале
         self._level_count = 0
         self._level_time = time.monotonic()
 
+    def stop(self, timeout: float = 2.0) -> bool:
+        """Просит поток остановиться и ждёт его. True — поток завершился вовремя.
+
+        Цикл проверяет флаг остановки не реже раза в 0,3 с, после выхода из него
+        закрывается аудиопоток (with stream) и освобождается микрофон.
+        """
+        self._stop_event.set()
+        if self.is_alive():
+            self.join(timeout)
+        if self.is_alive():
+            log.warning("поток распознавания не остановился за %.1f с", timeout)
+        return not self.is_alive()
+
     def run(self):
+        if self.debug_speech:
+            log.warning("включён подробный журнал речи: распознанные фразы пишутся в logs/voice.log")
+            self._emit("notice", "Включён подробный журнал речи: всё, что я слышу, пишется в logs/voice.log.")
         try:
             import sounddevice as sd
             import vosk
@@ -106,7 +134,13 @@ class VoiceListener(threading.Thread):
             return
 
         vosk.SetLogLevel(-1)
-        model = vosk.Model(ascii_path(self.model_path))
+        try:
+            model = vosk.Model(ascii_path(self.model_path))
+        except Exception:  # модель повреждена или неполная
+            log.exception("не удалось загрузить модель речи")
+            self._emit("error", "Не получилось загрузить модель речи. Скачай её заново (см. README). "
+                                "Голос пока не работает, команды можно писать текстом.")
+            return
         try:
             device, rate, self.channels = pick_microphone(sd)
             recognizer = vosk.KaldiRecognizer(model, rate)
@@ -139,8 +173,27 @@ class VoiceListener(threading.Thread):
         samples.frombytes(bytes(data))
         if self.channels > 1:  # стерео → берём один канал
             samples = samples[::self.channels]
-        self.audio.put(samples.tobytes())
+        self._enqueue(samples.tobytes())
         self._log_level(samples)
+
+    def _enqueue(self, block: bytes):
+        """Кладёт блок в очередь; если она полна — выбрасывает самый старый блок.
+
+        Для голосового помощника свежий звук важнее старого: лучше потерять
+        полсекунды давней тишины, чем отвечать с накопившейся задержкой.
+        """
+        try:
+            self.audio.put_nowait(block)
+        except queue.Full:
+            try:
+                self.audio.get_nowait()
+            except queue.Empty:
+                pass
+            self.dropped_blocks += 1
+            try:
+                self.audio.put_nowait(block)
+            except queue.Full:
+                self.dropped_blocks += 1
 
     def _log_level(self, samples):
         """Раз в 5 секунд пишет в журнал среднюю громкость микрофона и очередь звука."""
@@ -149,7 +202,8 @@ class VoiceListener(threading.Thread):
             self._level_count += 1
         if time.monotonic() - self._level_time >= 5:
             level = self._level_sum / max(self._level_count, 1)
-            log.info("громкость микрофона %.0f, в очереди %d блоков", level, self.audio.qsize())
+            log.info("громкость микрофона %.0f, в очереди %d блоков, выброшено всего %d",
+                     level, self.audio.qsize(), self.dropped_blocks)
             self._level_sum, self._level_count, self._level_time = 0.0, 0, time.monotonic()
 
     def _emit(self, kind: str, text: str = ""):
@@ -188,7 +242,7 @@ class VoiceListener(threading.Thread):
             waiting = True
             deadline = time.monotonic() + self.timeout
 
-        while True:
+        while not self._stop_event.is_set():
             try:
                 data = self.audio.get(timeout=0.3)
             except queue.Empty:
@@ -199,7 +253,7 @@ class VoiceListener(threading.Thread):
                     # Фраза закончилась (пауза в речи) — итоговый текст
                     text = normalize(json.loads(recognizer.Result()).get("text", ""))
                     self._last_partial = ""
-                    if text:
+                    if text and self.debug_speech:
                         log.info("фраза: %s", text)
                     rest = self._split_wake(text)
                     if rest is not None:
@@ -207,7 +261,10 @@ class VoiceListener(threading.Thread):
                     if waiting:
                         command = rest if rest is not None else text
                         if self._is_command(command):
-                            log.info("команда: %s", command)
+                            if self.debug_speech:
+                                log.info("команда: %s", command)
+                            else:
+                                log.info("команда принята (%d слов)", len(command.split()))
                             self._emit("command", command)
                             waiting = False
                 else:
