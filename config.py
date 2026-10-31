@@ -109,4 +109,89 @@ def validate(config) -> list[str]:
     if isinstance(music, str) and isinstance(config.get("programs"), dict) and music not in config["programs"]:
         errors.append(f"«music_program»: программы «{music}» нет в разделе programs")
 
+    errors += _validate_cloud(config.get("cloud"))
+    errors += _validate_ai(config.get("ai"))
+    errors += [f"«{path}»: ключи и пароли нельзя хранить в config.json — используй "
+               f"python secret_store.py set <имя>" for path in _secret_like_keys(config)]
     return errors
+
+
+CLOUD_TYPES = {
+    "enabled": bool,
+    "allow_fallback": bool,
+    "max_words": int,
+    "min_confidence": NUMBER,
+    "daily_request_limit": int,
+}
+AI_TASKS = {"chat", "complex", "coding"}
+SECRET_WORDS = ("key", "token", "secret", "password", "passwd", "ключ", "пароль", "токен")
+
+
+def _validate_cloud(cloud) -> list[str]:
+    if cloud is None:
+        return []  # раздела нет — облако выключено (конфиг этапа 1 работает без изменений)
+    if not isinstance(cloud, dict):
+        return ["«cloud» должен быть объектом { ... }"]
+    errors = []
+    for key, value in cloud.items():
+        expected = CLOUD_TYPES.get(key)
+        if expected is None:
+            errors.append(f"cloud → неизвестный параметр «{key}»")
+        elif not _type_ok(value, expected):
+            errors.append(f"cloud → «{key}» имеет неверный тип")
+    if _type_ok(cloud.get("max_words"), int) and cloud["max_words"] < 1:
+        errors.append("cloud → «max_words» должен быть больше нуля")
+    if _type_ok(cloud.get("min_confidence"), NUMBER) and not 0 <= cloud["min_confidence"] <= 1:
+        errors.append("cloud → «min_confidence» должен быть от 0 до 1")
+    if _type_ok(cloud.get("daily_request_limit"), int) and cloud["daily_request_limit"] < 0:
+        errors.append("cloud → «daily_request_limit» не может быть отрицательным")
+    return errors
+
+
+def _validate_ai(ai) -> list[str]:
+    if ai is None:
+        return []
+    if not isinstance(ai, dict):
+        return ["«ai» должен быть объектом { ... }"]
+    errors = []
+    providers = ai.get("providers", {})
+    if not isinstance(providers, dict):
+        errors.append("ai → «providers» должен быть объектом { ... }")
+    else:
+        for name, settings in providers.items():
+            if not isinstance(settings, dict):
+                errors.append(f"ai → providers → {name}: должен быть объектом {{ ... }}")
+                continue
+            if "model" in settings and not isinstance(settings["model"], str):
+                errors.append(f"ai → providers → {name}: «model» должен быть строкой")
+            timeout = settings.get("timeout", 1)
+            if not _type_ok(timeout, NUMBER) or timeout <= 0:
+                errors.append(f"ai → providers → {name}: «timeout» должен быть числом больше нуля")
+    routing = ai.get("routing", {})
+    if not isinstance(routing, dict):
+        errors.append("ai → «routing» должен быть объектом { ... }")
+    else:
+        for task, order in routing.items():
+            if task not in AI_TASKS:
+                errors.append(f"ai → routing: неизвестный тип задачи «{task}» (есть: {', '.join(sorted(AI_TASKS))})")
+            if not isinstance(order, list) or not all(isinstance(n, str) for n in order):
+                errors.append(f"ai → routing → {task}: должен быть списком имён провайдеров")
+    return errors
+
+
+def _secret_like_keys(value, path: str = "", names_are_entries: bool = False):
+    """Названия параметров, похожие на ключи и пароли (на любой глубине).
+
+    В разделах programs и sites ключи словаря — это имена программ и сайтов,
+    выбранные пользователем (например, «keepass»), их не проверяем.
+    """
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            where = f"{path} → {key}" if path else str(key)
+            if not names_are_entries and any(word in str(key).lower() for word in SECRET_WORDS):
+                yield where
+            entries = not path and key in ("programs", "sites")
+            yield from _secret_like_keys(inner, where, names_are_entries=entries)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _secret_like_keys(item, path)

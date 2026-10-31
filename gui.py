@@ -64,12 +64,12 @@ def work_area() -> tuple[int, int, int, int]:
 
 
 class PetApp:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, dialogue: DialogueManager | None = None):
         enable_dpi_awareness()
         self.config = config
         self.name = config.get("assistant_name", "Люся")
         # Вся логика команд и диалога — в ядре; окно только показывает его ответы
-        self.dialogue = DialogueManager(config)
+        self.dialogue = dialogue or DialogueManager(config)
 
         self.root = tk.Tk()
         self.root.title(self.name)

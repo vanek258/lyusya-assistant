@@ -50,6 +50,22 @@ def acquire_single_instance(name: str = MUTEX_NAME):
     return handle
 
 
+def build_ai(config: dict):
+    """ИИ-провайдеры. Пока ни одного не подключено — Gemini появится на этапе 3.
+
+    Возвращает AIRouter или None (тогда Люся отвечает «ИИ пока не подключён»).
+    """
+    from ai.router import AIRouter
+    providers = {}
+    return AIRouter(config, providers) if providers else None
+
+
+def build_dialogue(config: dict):
+    """Собирает ядро: исполнитель → инструменты → маршрутизатор → ИИ → диалог."""
+    from dialogue import DialogueManager
+    return DialogueManager(config, ai=build_ai(config))
+
+
 def show_message(title: str, text: str, console: bool) -> None:
     """Показывает сообщение: в консоли — текстом, иначе — окошком."""
     if console:
@@ -82,7 +98,7 @@ def main() -> None:
         logging.basicConfig(filename=logs / "voice.log", filemode="w", encoding="utf-8",
                             level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
         from gui import PetApp
-        PetApp(config).run()
+        PetApp(config, build_dialogue(config)).run()
 
 
 if __name__ == "__main__":
