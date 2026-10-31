@@ -12,11 +12,17 @@ CONFIG = {"assistant_name": "Люся", "programs": {}, "sites": {}}
 
 
 class FakeExecutor:
+    site_aliases = {"ютуб": {}}
+    program_aliases = {"браузер": {}, "блокнот": {}}
+
     def __init__(self, response=None, error=None, gate=None):
         self.response = response or Response("Готово.", effect="launch")
         self.error = error
         self.gate = gate  # threading.Event: держит выполнение, пока тест не отпустит
         self.commands = []
+
+    def _find_file(self, name):
+        return None
 
     def execute(self, cmd):
         self.commands.append(cmd)

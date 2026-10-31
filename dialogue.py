@@ -13,16 +13,21 @@ import ctypes
 import logging
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import media
-from commands import parse
+from commands import normalize, parse
 from events import HEARD, LISTENING, NOTICE, THINKING, TIMEOUT, VOICE, Reply, StateEvent, Utterance
 from executor import Executor, Response
+from tools import NEEDS_CONFIRMATION, ToolCall, ToolManager
 
 log = logging.getLogger("dialogue")
 
 MUSIC_EFFECTS = {"music_on", "music_off", "music_launch", "music_close"}
+YES = {"да", "ага", "угу", "давай", "конечно", "подтверждаю", "да давай"}
+NO = {"нет", "не", "не надо", "отмена", "отмени", "нет не надо"}
+CONFIRM_SECONDS = 10  # сколько ждать ответа «да / нет»
 
 
 class VoiceSink:
@@ -36,10 +41,14 @@ class VoiceSink:
 
 
 class DialogueManager:
-    def __init__(self, config: dict, executor: Executor | None = None, ducker=None):
+    def __init__(self, config: dict, executor: Executor | None = None, ducker=None,
+                 tools: ToolManager | None = None, clock=time.monotonic):
         self.config = config
         self.name = config.get("assistant_name", "Люся")
         self.executor = executor or Executor(config)
+        self.tools = tools or ToolManager(self.executor)
+        self._clock = clock
+        self._pending: tuple[ToolCall, float] | None = None  # действие, ждущее «да», и срок
         self.ducker = ducker if ducker is not None else (media.Ducker() if media.AVAILABLE else None)
         self.outbox: queue.Queue = queue.Queue()
         self.voice_sink = VoiceSink(self._on_voice)
@@ -124,7 +133,24 @@ class DialogueManager:
         self.outbox.put(Reply(response.text, response.ok, response.effect, response.keep_running, request_id))
 
     def _handle(self, utterance: Utterance) -> Response:
-        return self.executor.execute(parse(utterance.text, self.name))
+        # Ответ на вопрос «точно?» — только сразу после него и только «да» / «нет»
+        pending, self._pending = self._pending, None
+        if pending is not None and self._clock() <= pending[1]:
+            answer = normalize(utterance.text)
+            if answer in YES:
+                return self.tools.call(pending[0], confirmed=True)
+            if answer in NO:
+                return Response("Хорошо, не буду.")
+            # другая фраза — подтверждение отменяется, фраза обрабатывается как обычно
+
+        cmd = parse(utterance.text, self.name)
+        call = self.tools.from_command(cmd)
+        if call is None:  # помощь, выход, непонятное — не действия с Windows
+            return self.executor.execute(cmd)
+        response = self.tools.call(call)
+        if response.effect == NEEDS_CONFIRMATION:
+            self._pending = (call, self._clock() + CONFIRM_SECONDS)
+        return response
 
     def _after_response(self, response: Response):
         """Музыка после команды: не про музыку — вернуть, про музыку — оставить как решила команда."""
