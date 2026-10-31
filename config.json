@@ -1,0 +1,68 @@
+{
+  "assistant_name": "Люся",
+
+  "programs": {
+    "browser": {
+      "aliases": ["браузер", "хром", "chrome", "гугл хром"],
+      "target": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "process": "chrome.exe"
+    },
+    "yandex_browser": {
+      "aliases": ["яндекс браузер", "яндекс"],
+      "target": "C:\\Program Files\\Yandex\\YandexBrowser\\Application\\browser.exe",
+      "process": "browser.exe"
+    },
+    "discord": {
+      "aliases": ["discord", "дискорд", "дис"],
+      "target": "shell:AppsFolder\\com.squirrel.Discord.Discord",
+      "process": "Discord.exe",
+      "force_close": true
+    },
+    "yandex_music": {
+      "aliases": ["яндекс музыку", "яндекс музыка", "яндекс.музыку", "яндекс.музыка", "музыку", "музыка"],
+      "target": "shell:AppsFolder\\A025C540.Yandex.Music_vfvw9svesycw6!App",
+      "process": "Y.Music.exe"
+    },
+    "notepad": {
+      "aliases": ["блокнот", "notepad"],
+      "target": "notepad.exe",
+      "process": "notepad.exe"
+    },
+    "calculator": {
+      "aliases": ["калькулятор", "calculator"],
+      "target": "calc.exe",
+      "process": "CalculatorApp.exe"
+    },
+    "explorer": {
+      "aliases": ["проводник", "explorer"],
+      "target": "explorer.exe"
+    }
+  },
+
+  "sites": {
+    "youtube": {
+      "aliases": ["youtube", "ютуб", "ютюб", "ютубе"],
+      "url": "https://www.youtube.com"
+    },
+    "twitch": {
+      "aliases": ["twitch", "твич"],
+      "url": "https://www.twitch.tv"
+    }
+  },
+
+  "music_program": "yandex_music",
+  "music_app_id": "Yandex.Music",
+
+  "volume_step_presses": 5,
+
+  "voice_model": "models/vosk-model-small-ru-0.22",
+  "wake_words": ["люся", "люсь", "люсе", "люсю"],
+  "raw_microphone": true,
+  "max_command_words": 6,
+  "command_timeout": 7,
+
+  "sprite_scale": 2.4,
+
+  "search_folders": ["~/Desktop", "~/Documents", "~/Downloads"],
+  "search_depth": 2
+}
