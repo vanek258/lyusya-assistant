@@ -172,5 +172,59 @@ class DialogueTest(unittest.TestCase):
         self.assertEqual((seen[0].source, seen[0].confidence), (VOICE, 0.42))
 
 
+class ClarifyTest(unittest.TestCase):
+    """Переспрос сомнительных фраз (облако включено, но ИИ подменён)."""
+
+    def setUp(self):
+        config = {**CONFIG, "cloud": {"enabled": True, "max_words": 25, "min_confidence": 0.75}}
+        self.dm = DialogueManager(config, executor=FakeExecutor(), ducker=FakeDucker())
+        self.addCleanup(self.dm.shutdown)
+        self.asked = []
+        self.dm._ask_ai = lambda utt: (self.asked.append(utt.text), Response("Ответ ИИ."))[1]
+        self.followups = []
+        self.dm.on_followup = lambda: self.followups.append(True)
+
+    def reply(self, utterance) -> Reply:
+        self.dm.submit(utterance)
+        while True:
+            item = self.dm.outbox.get(timeout=2)
+            if isinstance(item, Reply):
+                return item
+
+    def test_unsure_voice_is_asked_then_sent_after_yes(self):
+        r = self.reply(Utterance("расскажи анекдот про котов", source=VOICE, confidence=0.4))
+        self.assertIn("Ты сказал", r.text)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.followups, [True])  # слушатель ждёт ответ без имени
+        self.assertEqual(self.reply(Utterance("да", source=VOICE)).text, "Ответ ИИ.")
+        self.assertEqual(self.asked, ["расскажи анекдот про котов"])
+
+    def test_unsure_voice_with_no_is_not_sent(self):
+        self.reply(Utterance("анекдот расскажи", source=VOICE))
+        self.reply(Utterance("нет", source=VOICE))
+        self.assertEqual(self.asked, [])
+
+    def test_clear_question_goes_to_ai(self):
+        r = self.reply(Utterance("расскажи анекдот про котов", source=VOICE, confidence=0.95))
+        self.assertEqual(r.text, "Ответ ИИ.")
+
+    def test_voice_without_wake_is_ignored_silently(self):
+        r = self.reply(Utterance("расскажи анекдот про котов", source=VOICE, wake_confirmed=False))
+        self.assertEqual(r.effect, "ignored")
+        self.assertEqual(self.asked, [])
+
+
+class CloudDisabledTest(unittest.TestCase):
+    def test_unknown_phrase_answers_cannot(self):
+        dm = DialogueManager(CONFIG, executor=FakeExecutor(), ducker=FakeDucker())
+        self.addCleanup(dm.shutdown)
+        dm.submit(Utterance("расскажи анекдот про котов"))
+        while True:
+            item = dm.outbox.get(timeout=2)
+            if isinstance(item, Reply):
+                break
+        self.assertIn("пока не умею", item.text)
+
+
 if __name__ == "__main__":
     unittest.main()

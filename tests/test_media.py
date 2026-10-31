@@ -1,7 +1,6 @@
 """Таймауты медиасессий и последовательная пауза музыки (Ducker)."""
 
 import asyncio
-import threading
 import time
 import unittest
 

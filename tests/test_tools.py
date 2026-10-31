@@ -127,8 +127,9 @@ class ConfirmationFlowTest(unittest.TestCase):
         self.say("открой setup")
         self.say("пауза")
         self.assertEqual(self.executor.commands, [(MEDIA, "pause")])
-        self.say("да")  # подтверждать уже нечего
-        self.assertEqual(self.executor.commands, [(MEDIA, "pause"), ("unknown", "да")])
+        reply = self.say("да")  # подтверждать уже нечего — это просто непонятная фраза
+        self.assertEqual(self.executor.commands, [(MEDIA, "pause")])
+        self.assertIn("не умею", reply.text)
 
     def test_expired_confirmation_is_ignored(self):
         self.say("открой setup")

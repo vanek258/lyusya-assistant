@@ -30,6 +30,21 @@ OPTIONAL = {
 }
 
 
+# Облачная обработка: выключена, пока пользователь сам её не включит
+CLOUD_DEFAULTS = {
+    "enabled": False,
+    "allow_fallback": False,
+    "max_words": 25,
+    "min_confidence": 0.75,
+    "daily_request_limit": 200,
+}
+
+
+def cloud_settings(config: dict) -> dict:
+    """Настройки облака с подставленными значениями по умолчанию."""
+    return {**CLOUD_DEFAULTS, **config.get("cloud", {})}
+
+
 class ConfigError(Exception):
     """Ошибка в config.json — текст можно показать пользователю как есть."""
 

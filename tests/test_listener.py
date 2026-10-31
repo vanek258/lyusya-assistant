@@ -60,18 +60,18 @@ class ListenerTest(unittest.TestCase):
         self.assertFalse(thread.is_alive(), "цикл не остановился по флагу")
         events = []
         while not self.events.empty():
-            kind, text = self.events.get()
-            if kind != "partial":
-                events.append((kind, text))
+            item = self.events.get()
+            if item[0] != "partial":
+                events.append(item)
         return events
 
     def test_name_then_command(self):
         events = self.run_script([("partial", "люся"), ("final", ""), ("final", "открой браузер")])
-        self.assertEqual(events, [("wake", ""), ("command", "открой браузер")])
+        self.assertEqual(events, [("wake", ""), ("command", "открой браузер", 1.0)])
 
     def test_name_and_command_in_one_phrase(self):
         events = self.run_script([("final", "люська сделай погромче")])
-        self.assertEqual(events, [("wake", ""), ("command", "сделай погромче")])
+        self.assertEqual(events, [("wake", ""), ("command", "сделай погромче", 1.0)])
 
     def test_speech_without_name_is_ignored(self):
         events = self.run_script([("final", "закрой окно пожалуйста"), ("final", "люстра горит")])
@@ -97,6 +97,26 @@ class ListenerTest(unittest.TestCase):
             self.run_script([("final", "люся открой браузер")], config={"debug_speech_log": True})
         self.assertIn("открой браузер", "\n".join(logs.output))
 
+    def test_confidence_of_words_after_name(self):
+        result = {"result": [{"word": "люся", "conf": 1.0}, {"word": "открой", "conf": 0.8},
+                             {"word": "браузер", "conf": 0.6}]}
+        self.assertAlmostEqual(self.listener._confidence(result), 0.7)
+
+    def test_confidence_without_word_info(self):
+        self.assertEqual(self.listener._confidence({"text": "пауза"}), 1.0)
+
+    def test_listen_again_waits_without_name(self):
+        self.listener.listen_again()
+        events = self.run_script([("final", "да")])
+        self.assertEqual(events, [("wake", "followup"), ("command", "да", 1.0)])
+
+    def test_cloud_allows_longer_phrases(self):
+        phrase = "люся расскажи пожалуйста как устроены черные дыры во вселенной"
+        self.assertEqual(self.run_script([("final", phrase)]), [("wake", "")])  # облако выключено
+        self.events = queue.Queue()
+        events = self.run_script([("final", phrase)], config={"cloud": {"enabled": True, "max_words": 25}})
+        self.assertEqual(events[-1][:2], ("command", "расскажи пожалуйста как устроены черные дыры во вселенной"))
+
     def test_queue_is_bounded_and_drops_oldest(self):
         lst = self.listener
         for i in range(AUDIO_QUEUE_BLOCKS + 10):
@@ -115,7 +135,7 @@ class ListenerTest(unittest.TestCase):
         with mock.patch.dict("sys.modules", {"vosk": fake_vosk, "sounddevice": mock.MagicMock()}), \
                 self.assertLogs("voice", level="ERROR"):
             lst.run()
-        kind, text = self.events.get_nowait()
+        kind, text = self.events.get_nowait()[:2]
         self.assertEqual(kind, "error")
         self.assertIn("модель речи", text)
 

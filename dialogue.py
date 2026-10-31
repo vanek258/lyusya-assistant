@@ -17,14 +17,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import media
-from commands import normalize, parse
+from commands import normalize
 from events import HEARD, LISTENING, NOTICE, THINKING, TIMEOUT, VOICE, Reply, StateEvent, Utterance
 from executor import Executor, Response
-from tools import NEEDS_CONFIRMATION, ToolCall, ToolManager
+from intent_router import CLOUD_DISABLED, LONG_COMMAND, TOO_LONG, UNSURE, IntentRouter, Route
+from tools import NEEDS_CONFIRMATION, ToolManager
 
 log = logging.getLogger("dialogue")
 
 MUSIC_EFFECTS = {"music_on", "music_off", "music_launch", "music_close"}
+IGNORED = "ignored"  # effect ответа: фраза пропущена, показывать нечего
 YES = {"да", "ага", "угу", "давай", "конечно", "подтверждаю", "да давай"}
 NO = {"нет", "не", "не надо", "отмена", "отмени", "нет не надо"}
 CONFIRM_SECONDS = 10  # сколько ждать ответа «да / нет»
@@ -42,13 +44,18 @@ class VoiceSink:
 
 class DialogueManager:
     def __init__(self, config: dict, executor: Executor | None = None, ducker=None,
-                 tools: ToolManager | None = None, clock=time.monotonic):
+                 tools: ToolManager | None = None, router: IntentRouter | None = None,
+                 clock=time.monotonic):
         self.config = config
         self.name = config.get("assistant_name", "Люся")
         self.executor = executor or Executor(config)
         self.tools = tools or ToolManager(self.executor)
+        self.router = router or IntentRouter(config)
         self._clock = clock
-        self._pending: tuple[ToolCall, float] | None = None  # действие, ждущее «да», и срок
+        # Что выполнить, если пользователь скажет «да», и до какого момента ждать
+        self._pending: tuple[callable, float] | None = None
+        # Вызывается, когда Люся задала вопрос и ждёт «да / нет» (слушатель ждёт ответ без имени)
+        self.on_followup = None
         self.ducker = ducker if ducker is not None else (media.Ducker() if media.AVAILABLE else None)
         self.outbox: queue.Queue = queue.Queue()
         self.voice_sink = VoiceSink(self._on_voice)
@@ -94,7 +101,7 @@ class DialogueManager:
                 return
             if self.ducker is not None:
                 self.ducker.duck()  # пауза музыке, чтобы лучше слышать команду
-            self.outbox.put(StateEvent(LISTENING))
+            self.outbox.put(StateEvent(LISTENING, text))  # text == "followup": ждёт ответ на вопрос
         elif kind == "partial":
             self.outbox.put(StateEvent(HEARD, text))
         elif kind == "command":
@@ -131,26 +138,59 @@ class DialogueManager:
             log.info("ответ на запрос %d отброшен как устаревший", request_id)
             return
         self.outbox.put(Reply(response.text, response.ok, response.effect, response.keep_running, request_id))
+        if self._pending is not None and self.on_followup is not None:
+            self.on_followup()  # Люся спросила «да?» — выслушать ответ без имени
 
     def _handle(self, utterance: Utterance) -> Response:
-        # Ответ на вопрос «точно?» — только сразу после него и только «да» / «нет»
+        # Ответ на вопрос Люси — только сразу после него и только «да» / «нет»
         pending, self._pending = self._pending, None
         if pending is not None and self._clock() <= pending[1]:
             answer = normalize(utterance.text)
             if answer in YES:
-                return self.tools.call(pending[0], confirmed=True)
+                return pending[0]()
             if answer in NO:
                 return Response("Хорошо, не буду.")
-            # другая фраза — подтверждение отменяется, фраза обрабатывается как обычно
+            # другая фраза — вопрос снимается, фраза обрабатывается как обычно
 
-        cmd = parse(utterance.text, self.name)
+        decision = self.router.decide(utterance)
+        if decision.route is Route.IGNORE:
+            return Response("", effect=IGNORED)
+        if decision.route is Route.LOCAL:
+            return self._run_command(decision.command)
+        if decision.route is Route.CLOUD:
+            return self._ask_ai(utterance)
+        return self._clarify(decision.reason, utterance, decision.command)
+
+    def _run_command(self, cmd) -> Response:
         call = self.tools.from_command(cmd)
-        if call is None:  # помощь, выход, непонятное — не действия с Windows
+        if call is None:  # помощь и выход — не действия с Windows
             return self.executor.execute(cmd)
         response = self.tools.call(call)
         if response.effect == NEEDS_CONFIRMATION:
-            self._pending = (call, self._clock() + CONFIRM_SECONDS)
+            self._ask_yes(lambda: self.tools.call(call, confirmed=True))
         return response
+
+    def _clarify(self, reason: str, utterance: Utterance, cmd) -> Response:
+        heard = normalize(utterance.text)
+        if reason == LONG_COMMAND:
+            self._ask_yes(lambda: self._run_command(cmd))
+            return Response(f"Ты сказал: «{heard}»? Скажи «да», если это мне.", ok=False)
+        if reason == UNSURE:
+            self._ask_yes(lambda: self._ask_ai(utterance))
+            return Response(f"Ты сказал: «{heard}»? Скажи «да», и я спрошу у ИИ.", ok=False)
+        if reason == TOO_LONG:
+            return Response("Фраза длинная — не уверена, что это мне. Повтори покороче.", ok=False)
+        if reason == CLOUD_DISABLED:
+            return Response("Этого я пока не умею. Скажи «помощь», чтобы узнать, что я могу.", ok=False)
+        return Response("Не поняла.", ok=False)
+
+    def _ask_yes(self, action):
+        """Запомнить, что сделать, если пользователь ответит «да»."""
+        self._pending = (action, self._clock() + CONFIRM_SECONDS)
+
+    def _ask_ai(self, utterance: Utterance) -> Response:
+        # Подключение ИИ — шаг 2.4; до него облачный путь честно сообщает, что ИИ нет
+        return Response("ИИ пока не подключён.", ok=False)
 
     def _after_response(self, response: Response):
         """Музыка после команды: не про музыку — вернуть, про музыку — оставить как решила команда."""

@@ -12,8 +12,10 @@
 
 Результаты отправляются в очередь событий:
   ("wake", "")        — услышала имя, сигнал уже прозвучал
+  ("wake", "followup") — слушает ответ на свой вопрос (без имени)
   ("partial", текст)  — что слышно прямо сейчас (для облачка)
-  ("command", текст)  — готовая команда
+  ("command", текст, уверенность) — готовая команда и средняя уверенность
+                       распознавания её слов (0…1)
   ("timeout", "")     — после имени ничего не сказали
   ("error", текст)    — нет модели, библиотек или микрофона
   ("notice", текст)   — служебное сообщение (например, включён подробный журнал)
@@ -36,6 +38,7 @@ from pathlib import Path
 
 import sounds
 from commands import UNKNOWN, normalize, parse
+from config import cloud_settings
 
 # Журнал голоса (logs/voice.log): громкость микрофона, сбои потока, срабатывания имени.
 # Нужен, чтобы разбираться, почему она не услышала команду.
@@ -44,6 +47,8 @@ log = logging.getLogger("voice")
 # Сколько блоков звука (по 0,2 с) может ждать распознавания. Если распознавание
 # не успевает, самые старые блоки выбрасываются — иначе задержка росла бы бесконечно.
 AUDIO_QUEUE_BLOCKS = 25
+
+FOLLOWUP = "followup"  # текст события wake: ждём ответ на вопрос Люси, а не новую команду
 
 
 def ascii_path(path: Path) -> str:
@@ -94,7 +99,12 @@ class VoiceListener(threading.Thread):
         self.model_path = Path(__file__).parent / config.get("voice_model", "models/vosk-model-small-ru-0.22")
         self.wake_words = {normalize(w) for w in config.get("wake_words", ["люся", "люсь"])}
         self.timeout = config.get("command_timeout", 7)
-        self.max_command_words = config.get("max_command_words", 6)
+        # Длинные фразы — скорее подслушанный кусок видео или песни. Если включено облако,
+        # пропускаем фразы подлиннее (вопросы к ИИ), их дальше проверит IntentRouter
+        cloud = cloud_settings(config)
+        self.max_command_words = max(config.get("max_command_words", 6),
+                                     cloud["max_words"] if cloud["enabled"] else 0)
+        self._followup = threading.Event()  # выслушать ответ «да / нет» без обращения по имени
         self.raw_mic = config.get("raw_microphone", True)
         self.debug_speech = config.get("debug_speech_log", False)
         self.audio: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_BLOCKS)
@@ -105,6 +115,10 @@ class VoiceListener(threading.Thread):
         self._level_sum = 0.0    # для средней громкости микрофона в журнале
         self._level_count = 0
         self._level_time = time.monotonic()
+
+    def listen_again(self):
+        """Выслушать следующую фразу без имени — после вопроса Люси «Скажи «да»»."""
+        self._followup.set()
 
     def stop(self, timeout: float = 2.0) -> bool:
         """Просит поток остановиться и ждёт его. True — поток завершился вовремя.
@@ -144,6 +158,7 @@ class VoiceListener(threading.Thread):
         try:
             device, rate, self.channels = pick_microphone(sd)
             recognizer = vosk.KaldiRecognizer(model, rate)
+            recognizer.SetWords(True)  # уверенность для каждого слова
             stream = None
             if self.raw_mic:
                 try:
@@ -206,8 +221,21 @@ class VoiceListener(threading.Thread):
                      level, self.audio.qsize(), self.dropped_blocks)
             self._level_sum, self._level_count, self._level_time = 0.0, 0, time.monotonic()
 
-    def _emit(self, kind: str, text: str = ""):
-        self.events.put((kind, text))
+    def _emit(self, kind: str, text: str = "", *extra):
+        self.events.put((kind, text, *extra))
+
+    def _confidence(self, result: dict) -> float:
+        """Средняя уверенность слов команды (слов после имени, если оно есть в фразе).
+
+        Если распознаватель не вернул сведений о словах — 1.0.
+        """
+        words = result.get("result") or []
+        if not words:
+            return 1.0
+        prefixes = tuple(self.wake_words)
+        name_at = next((i for i, w in enumerate(words) if normalize(w.get("word", "")).startswith(prefixes)), None)
+        tail = words[name_at + 1:] if name_at is not None and name_at + 1 < len(words) else words
+        return sum(w.get("conf", 1.0) for w in tail) / len(tail)
 
     def _split_wake(self, text: str) -> str | None:
         """Ищет имя в тексте. Возвращает слова после имени или None, если имени нет."""
@@ -217,32 +245,40 @@ class VoiceListener(threading.Thread):
                 return " ".join(words[i + 1:])
         return None
 
-    def _is_command(self, text: str) -> bool:
+    def _is_command(self, text: str, answer: bool = False) -> bool:
         """Решает, похоже ли это на команду, которую говорят именно ей.
 
         Отсеивает одно непонятное слово (обычно само имя, услышанное неточно)
         и длинные фразы — это скорее подслушанный кусок видео или песни,
-        выполнять такое нельзя.
+        выполнять такое нельзя. answer — ждём ответ на вопрос Люси: тогда
+        одно слово («да», «нет») — нормальный ответ.
         """
         words = text.split()
         if not words or len(words) > self.max_command_words:
             return False
+        if answer:
+            return True
         return not (len(words) == 1 and parse(text, self.name).intent == UNKNOWN)
 
     def _loop(self, recognizer):
-        waiting = False  # имя прозвучало, ждём команду
+        waiting = False  # имя прозвучало (или Люся задала вопрос), ждём фразу
+        answer = False   # ждём именно ответ на вопрос Люси
         deadline = 0.0
 
-        def start_waiting():
-            nonlocal waiting, deadline
+        def start_waiting(reason: str = ""):
+            nonlocal waiting, answer, deadline
             if not waiting:
-                log.info("услышала имя")
+                log.info("жду ответ" if reason else "услышала имя")
                 sounds.play(sounds.WAKE)
-                self._emit("wake")
+                self._emit("wake", reason)
+                answer = reason == FOLLOWUP
             waiting = True
             deadline = time.monotonic() + self.timeout
 
         while not self._stop_event.is_set():
+            if self._followup.is_set():  # Люся задала вопрос — ждём ответ без имени
+                self._followup.clear()
+                start_waiting(FOLLOWUP)
             try:
                 data = self.audio.get(timeout=0.3)
             except queue.Empty:
@@ -251,7 +287,8 @@ class VoiceListener(threading.Thread):
             if data is not None:
                 if recognizer.AcceptWaveform(data):
                     # Фраза закончилась (пауза в речи) — итоговый текст
-                    text = normalize(json.loads(recognizer.Result()).get("text", ""))
+                    result = json.loads(recognizer.Result())
+                    text = normalize(result.get("text", ""))
                     self._last_partial = ""
                     if text and self.debug_speech:
                         log.info("фраза: %s", text)
@@ -260,12 +297,12 @@ class VoiceListener(threading.Thread):
                         start_waiting()
                     if waiting:
                         command = rest if rest is not None else text
-                        if self._is_command(command):
+                        if self._is_command(command, answer and rest is None):
                             if self.debug_speech:
                                 log.info("команда: %s", command)
                             else:
                                 log.info("команда принята (%d слов)", len(command.split()))
-                            self._emit("command", command)
+                            self._emit("command", command, self._confidence(result))
                             waiting = False
                 else:
                     # Фраза ещё произносится — промежуточный текст

@@ -16,7 +16,7 @@ import random
 import time
 import tkinter as tk
 
-from dialogue import DialogueManager
+from dialogue import IGNORED, DialogueManager
 from events import HEARD, LISTENING, NOTICE, THINKING, TIMEOUT, TYPED, Reply, Utterance
 from listener import VoiceListener
 from sprites import SIZE, Pose, render
@@ -132,6 +132,7 @@ class PetApp:
 
     def run(self):
         self.listener = VoiceListener(self.config, self.dialogue.voice_sink)
+        self.dialogue.on_followup = self.listener.listen_again
         self.listener.start()
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
         self.set_state("wave", 3)
@@ -205,7 +206,8 @@ class PetApp:
                 self._show_reply(item)
             elif item.state == LISTENING:
                 self.set_state("listen", 12)
-                self.say("Да?")
+                if not item.text:  # при ответе на вопрос сам вопрос остаётся на экране
+                    self.say("Да?")
             elif item.state == HEARD and self.state == "listen":
                 self.say(item.text + "…", instant=True)
             elif item.state == THINKING:
@@ -217,6 +219,9 @@ class PetApp:
                 self.say(item.text)
 
     def _show_reply(self, reply: Reply):
+        if reply.effect == IGNORED:  # фраза пропущена — просто возвращаемся к своим делам
+            self.set_state("idle", 2)
+            return
         self.say(reply.text)
         if reply.effect in ("music_on", "music_launch"):
             self.music_on = True
