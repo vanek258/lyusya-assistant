@@ -17,9 +17,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import media
-from ai.provider import USER, Message, ProviderError
+import persona
+from ai.provider import ASSISTANT, USER, Message, ProviderError
 from ai.router import AIRouter
 from commands import normalize
+from memory import MemoryManager
 from events import HEARD, LISTENING, NOTICE, THINKING, TIMEOUT, VOICE, Reply, StateEvent, Utterance
 from executor import Executor, Response
 from intent_router import CLOUD_DISABLED, LONG_COMMAND, TOO_LONG, UNSURE, IntentRouter, Route
@@ -47,13 +49,16 @@ class VoiceSink:
 class DialogueManager:
     def __init__(self, config: dict, executor: Executor | None = None, ducker=None,
                  tools: ToolManager | None = None, router: IntentRouter | None = None,
-                 ai: AIRouter | None = None, clock=time.monotonic):
+                 ai: AIRouter | None = None, memory: MemoryManager | None = None,
+                 clock=time.monotonic):
         self.config = config
         self.name = config.get("assistant_name", "Люся")
         self.executor = executor or Executor(config)
         self.tools = tools or ToolManager(self.executor)
         self.router = router or IntentRouter(config)
         self.ai = ai  # None — ни один ИИ-провайдер не подключён
+        self.memory = memory or MemoryManager()
+        self.system_prompt = persona.system_prompt(self.name)
         self._clock = clock
         # Что выполнить, если пользователь скажет «да», и до какого момента ждать
         self._pending: tuple[callable, float] | None = None
@@ -194,10 +199,13 @@ class DialogueManager:
     def _ask_ai(self, utterance: Utterance) -> Response:
         if self.ai is None:
             return Response("ИИ пока не подключён.", ok=False)
+        messages = self.memory.context() + [Message(USER, utterance.text)]
         try:
-            result = self.ai.ask([Message(USER, utterance.text)])
+            result = self.ai.ask(messages, self.system_prompt)
         except ProviderError as e:
-            return Response(e.user_message, ok=False)
+            return Response(e.user_message, ok=False)  # неудачный обмен в память не попадает
+        self.memory.add(USER, utterance.text)
+        self.memory.add(ASSISTANT, result.text)
         return Response(result.text)
 
     def _after_response(self, response: Response):
