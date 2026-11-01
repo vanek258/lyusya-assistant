@@ -50,6 +50,10 @@ AUDIO_QUEUE_BLOCKS = 25
 
 FOLLOWUP = "followup"  # текст события wake: ждём ответ на вопрос Люси, а не новую команду
 
+# Распознаватель Vosk хранит весь услышанный звук с момента создания (~7,5 МБ в минуту),
+# поэтому раз в минуту заменяем его новым — только между фразами и не во время ожидания команды
+RECOGNIZER_REFRESH_SECONDS = 60
+
 
 def ascii_path(path: Path) -> str:
     """Vosk не умеет открывать пути с кириллицей (например, C:\\Users\\Иван\\...).
@@ -109,6 +113,8 @@ class VoiceListener(threading.Thread):
         self.debug_speech = config.get("debug_speech_log", False)
         self.audio: queue.Queue[bytes] = queue.Queue(maxsize=AUDIO_QUEUE_BLOCKS)
         self.dropped_blocks = 0  # сколько блоков выброшено из-за переполнения очереди
+        self.refresh_seconds = RECOGNIZER_REFRESH_SECONDS
+        self.recognizer_refreshes = 0
         self._stop_event = threading.Event()
         self.channels = 1
         self._last_partial = ""
@@ -157,8 +163,12 @@ class VoiceListener(threading.Thread):
             return
         try:
             device, rate, self.channels = pick_microphone(sd)
-            recognizer = vosk.KaldiRecognizer(model, rate)
-            recognizer.SetWords(True)  # уверенность для каждого слова
+
+            def make_recognizer():
+                recognizer = vosk.KaldiRecognizer(model, rate)
+                recognizer.SetWords(True)  # уверенность для каждого слова
+                return recognizer
+
             stream = None
             if self.raw_mic:
                 try:
@@ -171,7 +181,7 @@ class VoiceListener(threading.Thread):
             log.info("микрофон: %s, %d Гц, каналов: %d, сырой режим: %s",
                      sd.query_devices(device)["name"], rate, self.channels, raw)
             with stream:
-                self._loop(recognizer)
+                self._loop(make_recognizer(), make_recognizer)
         except Exception as e:  # микрофон занят, отключён или запрещён в настройках
             log.exception("поток микрофона упал")
             self._emit("error", f"Микрофон недоступен: {e}")
@@ -260,10 +270,11 @@ class VoiceListener(threading.Thread):
             return True
         return not (len(words) == 1 and parse(text, self.name).intent == UNKNOWN)
 
-    def _loop(self, recognizer):
+    def _loop(self, recognizer, make_recognizer=None):
         waiting = False  # имя прозвучало (или Люся задала вопрос), ждём фразу
         answer = False   # ждём именно ответ на вопрос Люси
         deadline = 0.0
+        created = time.monotonic()
 
         def start_waiting(reason: str = ""):
             nonlocal waiting, answer, deadline
@@ -304,6 +315,12 @@ class VoiceListener(threading.Thread):
                                 log.info("команда принята (%d слов)", len(command.split()))
                             self._emit("command", command, self._confidence(result))
                             waiting = False
+                    # Между фразами и не во время ожидания — время освободить накопленную память
+                    if (make_recognizer is not None and not waiting
+                            and time.monotonic() - created >= self.refresh_seconds):
+                        recognizer = make_recognizer()
+                        created = time.monotonic()
+                        self.recognizer_refreshes += 1
                 else:
                     # Фраза ещё произносится — промежуточный текст
                     partial = normalize(json.loads(recognizer.PartialResult()).get("partial", ""))

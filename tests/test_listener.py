@@ -117,6 +117,38 @@ class ListenerTest(unittest.TestCase):
         events = self.run_script([("final", phrase)], config={"cloud": {"enabled": True, "max_words": 25}})
         self.assertEqual(events[-1][:2], ("command", "расскажи пожалуйста как устроены черные дыры во вселенной"))
 
+    def test_project_wake_words_cover_name_forms(self):
+        from config import load_config
+        lst = VoiceListener(load_config(), self.events)
+        for phrase in ["люся помощь", "люська помощь", "люси помощь", "люсь помощь", "люсенька помощь"]:
+            self.assertEqual(lst._split_wake(phrase), "помощь", phrase)
+        for phrase in ["люстра горит", "люда помощь", "люди помощь"]:
+            self.assertIsNone(lst._split_wake(phrase), phrase)
+
+    def test_recognizer_is_refreshed_between_phrases(self):
+        """Против роста памяти: распознаватель заменяется, но не посреди ожидания команды."""
+        lst = self.listener
+        lst.refresh_seconds = 0
+        shared = [("final", "просто разговор"), ("final", "люся"), ("final", "открой браузер")]
+
+        def factory():  # новый распознаватель продолжает тот же поток звука
+            recognizer = FakeRecognizer([])
+            recognizer.script = shared
+            return recognizer
+
+        thread = threading.Thread(target=lst._loop, args=(factory(), factory), daemon=True)
+        thread.start()
+        for _ in range(3):
+            lst.audio.put(b"\0\0")
+        time.sleep(0.3)
+        lst._stop_event.set()
+        thread.join(2)
+        # после «просто разговор» — замена; после «люся» — нет (ждём команду); после команды — снова замена
+        self.assertEqual(lst.recognizer_refreshes, 2)
+        events = [e for e in iter(lambda: self.events.get() if not self.events.empty() else None, None)
+                  if e[0] != "partial"]
+        self.assertEqual(events, [("wake", ""), ("command", "открой браузер", 1.0)])
+
     def test_queue_is_bounded_and_drops_oldest(self):
         lst = self.listener
         for i in range(AUDIO_QUEUE_BLOCKS + 10):
