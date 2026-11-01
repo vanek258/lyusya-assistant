@@ -149,6 +149,16 @@ class DialogueTest(unittest.TestCase):
         self.assertEqual(self.ducker.calls, ["duck", "unduck"])
         self.assertIn(StateEvent(TIMEOUT), self.drain(dm))
 
+    def test_command_while_busy_is_not_lost_silently(self):
+        gate = threading.Event()
+        dm = self.make(gate=gate)
+        dm.submit(Utterance("открой браузер"))
+        dm.voice_sink.put(("command", "закрой браузер", 0.9))
+        notices = [i for i in self.drain(dm) if isinstance(i, StateEvent) and i.state == NOTICE]
+        self.assertTrue(any("занята" in n.text for n in notices))
+        gate.set()
+        self.next_reply(dm)
+
     def test_wake_while_busy_is_ignored(self):
         gate = threading.Event()
         dm = self.make(gate=gate)

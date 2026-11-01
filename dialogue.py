@@ -114,7 +114,9 @@ class DialogueManager:
             self.outbox.put(StateEvent(HEARD, text))
         elif kind == "command":
             confidence = rest[0] if rest else 1.0
-            self.submit(Utterance(text, source=VOICE, confidence=confidence))
+            if self.submit(Utterance(text, source=VOICE, confidence=confidence)) is None and text.strip():
+                # Люся ещё выполняет прошлую команду — не теряем новую молча
+                self.outbox.put(StateEvent(NOTICE, "Секунду, я ещё занята прошлой командой. Повтори чуть позже."))
         elif kind == "timeout":
             if self.ducker is not None:
                 self.ducker.unduck()

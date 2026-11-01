@@ -10,25 +10,32 @@ import logging
 import sys
 from pathlib import Path
 
-from commands import parse
 from config import ConfigError, load_config
-from executor import Executor
 
 
 def run_console(config: dict) -> None:
-    executor = Executor(config)
+    """Текстовый режим — через то же ядро, что и окно (с теми же проверками и подтверждениями)."""
+    from events import TYPED, Reply, Utterance
+    dialogue = build_dialogue(config)
     name = config.get("assistant_name", "Люся")
     print(f"{name}: Слушаю. Напишите «помощь», чтобы увидеть список команд.")
-    while True:
-        try:
-            text = input("Вы: ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        response = executor.execute(parse(text, name))
-        print(f"{name}: {response.text}")
-        if not response.keep_running:
-            break
+    try:
+        while True:
+            try:
+                text = input("Вы: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if dialogue.submit(Utterance(text, source=TYPED)) is None:
+                continue
+            reply = dialogue.outbox.get()
+            while not isinstance(reply, Reply):  # состояния («думаю») в консоли не нужны
+                reply = dialogue.outbox.get()
+            print(f"{name}: {reply.text}")
+            if not reply.keep_running:
+                break
+    finally:
+        dialogue.shutdown()
 
 
 MUTEX_NAME = "Local\\LyusyaAssistant"
