@@ -120,6 +120,13 @@ class PetApp:
         self.bubble_text = ""
         self.bubble_chars = 0     # сколько букв уже «напечатано»
         self.bubble_until = 0.0
+        self.bubble_pages = [""]  # длинная реплика делится на страницы
+        self.bubble_page = 0
+        # Ширина текста и высота, которая помещается над головой (даже при открытом поле ввода):
+        # нижний край облачка, поле ввода, отступы и табличка с именем
+        p = self.s
+        self.bubble_wrap = self.w - 14 * p
+        self.bubble_max_height = self.top - 4 * p - 10 * p - 2 * (4 * p) - 6 * p
         self._press = None
         self._dragged = False
 
@@ -165,11 +172,64 @@ class PetApp:
         self.state_until = self.state_start + duration if duration else float("inf")
 
     def say(self, text: str, instant: bool = False):
-        """Показывает реплику. instant — сразу целиком (для живого текста речи).
-        На этапе 3 здесь же будет озвучка."""
+        """Показывает реплику. Длинная делится на страницы, которые сменяют друг друга.
+
+        instant — сразу целиком (для живого текста речи: показываем только
+        последнюю страницу — самые свежие слова). На этапе 3 здесь же будет озвучка.
+        """
+        pages = self._paginate(text)
+        self.bubble_pages = pages[-1:] if instant else pages
+        self.bubble_page = 0
+        self._show_page(instant)
+
+    def _show_page(self, instant: bool = False):
+        text = self.bubble_pages[self.bubble_page]
         self.bubble_text = text
         self.bubble_chars = len(text) if instant else 0
-        self.bubble_until = time.monotonic() + 3.5 + len(text) / 12
+        self.bubble_until = time.monotonic() + 3.5 + len(text) / 12  # печать + время прочитать
+
+    def _next_page(self):
+        """Когда страница показана достаточно долго — следующая."""
+        if self.bubble_page + 1 < len(self.bubble_pages) and time.monotonic() > self.bubble_until:
+            self.bubble_page += 1
+            self._show_page()
+
+    def _text_height(self, text: str) -> int:
+        probe = self.canvas.create_text(0, 0, text=text, anchor="nw", width=self.bubble_wrap, font=FONT)
+        _, top, _, bottom = self.canvas.bbox(probe)
+        self.canvas.delete(probe)
+        return bottom - top
+
+    def _paginate(self, text: str) -> list[str]:
+        """Делит текст по словам на страницы, которые помещаются в облачко.
+
+        Сначала жадно — чтобы узнать, сколько нужно страниц; потом раздаёт слова
+        поровну по этому числу страниц, чтобы не было «хвоста» из одного слова.
+        """
+        words = text.split()
+        pages, current = [], ""
+        for word in words:
+            trial = f"{current} {word}".strip()
+            if current and self._text_height(trial) > self.bubble_max_height:
+                pages.append(current)
+                current = word
+            else:
+                current = trial
+        pages = pages + [current] if current or not pages else pages
+        if len(pages) < 2:
+            return pages
+
+        target = len(text) / len(pages)
+        balanced, current = [], ""
+        for word in words:
+            if current and len(current) >= target and len(balanced) < len(pages) - 1:
+                balanced.append(current)
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+        balanced.append(current)
+        fits = all(self._text_height(p) <= self.bubble_max_height for p in balanced)
+        return balanced if fits else pages
 
     def _pick_activity(self):
         """Выбирает, чем заняться дальше, когда никто не зовёт."""
@@ -301,6 +361,7 @@ class PetApp:
     def _animate(self):
         self.tick += 1
         self.bubble_chars = min(len(self.bubble_text), self.bubble_chars + TYPE_SPEED)
+        self._next_page()
         if self.dialogue is not None:
             self._handle_core()
         if time.monotonic() >= self.state_until:
@@ -389,7 +450,7 @@ class PetApp:
         if not self.bubble_text or time.monotonic() > self.bubble_until:
             return
         pad = 4 * p
-        wrap = self.w - 14 * p
+        wrap = self.bubble_wrap
         # Размер плашки считаем по полному тексту, чтобы она не прыгала, пока текст печатается
         probe = c.create_text(0, 0, text=self.bubble_text, anchor="nw", width=wrap, font=FONT)
         _, _, text_w, text_h = c.bbox(probe)
