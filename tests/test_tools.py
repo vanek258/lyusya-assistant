@@ -8,7 +8,7 @@ from commands import CLOSE, MEDIA, MUSIC, OPEN, VOLUME, Command
 from dialogue import DialogueManager
 from events import Reply, Utterance
 from executor import Response
-from tools import NEEDS_CONFIRMATION, Risk, ToolCall, ToolManager
+from tools import NEEDS_CONFIRMATION, Risk, ToolCall, ToolManager, resolve_alias
 
 
 class RecordingExecutor:
@@ -91,6 +91,29 @@ class ToolManagerTest(unittest.TestCase):
         self.assertIs(ToolManager.file_risk(Path("a.ps1")), Risk.HIGH)
         self.assertIs(ToolManager.file_risk(Path("a.LNK")), Risk.HIGH)
         self.assertIs(ToolManager.file_risk(Path("a.pdf")), Risk.LOW)
+
+
+class FuzzyAliasTest(unittest.TestCase):
+    """Распознавание иногда искажает названия — узнаём их, но только из списка."""
+
+    NAMES = ["дискорд", "браузер", "блокнот", "ютуб", "яндекс музыку"]
+
+    def test_misheard_names_are_recognized(self):
+        for heard, expected in [("диск орт", "дискорд"), ("дискорт", "дискорд"), ("браузеры", "браузер"),
+                                ("блокнота", "блокнот"), ("ютубе", "ютуб"), ("яндексмузыку", "яндекс музыку")]:
+            self.assertEqual(resolve_alias(heard, self.NAMES), expected, heard)
+
+    def test_different_words_are_not_guessed(self):
+        for heard in ["дискотеку", "блок", "фотошоп", "игра", "ют"]:
+            self.assertIsNone(resolve_alias(heard, self.NAMES), heard)
+
+    def test_misheard_program_opens_from_allowlist(self):
+        executor = RecordingExecutor()
+        executor.program_aliases = {"дискорд": {}}
+        call = ToolManager(executor).from_command(Command(OPEN, "диск орт"))
+        self.assertEqual((call.name, call.args), ("open_app", {"name": "дискорд"}))
+        call = ToolManager(executor).from_command(Command(CLOSE, "диск орт"))
+        self.assertEqual(call.args, {"name": "дискорд"})
 
 
 class ConfirmationFlowTest(unittest.TestCase):

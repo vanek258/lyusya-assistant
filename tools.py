@@ -9,6 +9,7 @@
 Сами действия выполняет Executor — его код не меняется.
 """
 
+import difflib
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -24,6 +25,27 @@ EXECUTABLE_EXTENSIONS = {".exe", ".bat", ".cmd", ".com", ".msi", ".ps1", ".vbs",
 
 MEDIA_ACTIONS = {"play", "pause", "next", "prev"}
 VOLUME_ACTIONS = {"up", "down", "mute"}
+
+FUZZY_CUTOFF = 0.8      # насколько похожим должно быть название, чтобы его узнать
+FUZZY_MIN_LETTERS = 4   # короткие слова не угадываем — слишком легко ошибиться
+
+
+def resolve_alias(name: str, aliases) -> str | None:
+    """Находит название из списка, даже если распознавание его исказило.
+
+    «диск орт» → «дискорд», «браузеры» → «браузер». Сравнение без пробелов
+    и только среди названий из config.json — открыть что-то вне списка так нельзя.
+    """
+    if name in aliases:
+        return name
+    compact = name.replace(" ", "")
+    by_compact = {a.replace(" ", ""): a for a in aliases}
+    if compact in by_compact:
+        return by_compact[compact]
+    if len(compact) < FUZZY_MIN_LETTERS:
+        return None
+    match = difflib.get_close_matches(compact, list(by_compact), n=1, cutoff=FUZZY_CUTOFF)
+    return by_compact[match[0]] if match else None
 
 
 class Risk(IntEnum):
@@ -65,13 +87,15 @@ class ToolManager:
     def from_command(self, cmd: Command) -> ToolCall | None:
         name = cmd.argument
         if cmd.intent == OPEN:
-            if name in self.executor.site_aliases:
-                return ToolCall("open_site", {"name": name})
-            if name in self.executor.program_aliases:
-                return ToolCall("open_app", {"name": name})
+            site = resolve_alias(name, self.executor.site_aliases)
+            if site:
+                return ToolCall("open_site", {"name": site})
+            program = resolve_alias(name, self.executor.program_aliases)
+            if program:
+                return ToolCall("open_app", {"name": program})
             return ToolCall("open_file", {"name": name})
         if cmd.intent == CLOSE:
-            return ToolCall("close_app", {"name": name})
+            return ToolCall("close_app", {"name": resolve_alias(name, self.executor.program_aliases) or name})
         if cmd.intent == MUSIC:
             return ToolCall("play_music")
         if cmd.intent == MEDIA:
